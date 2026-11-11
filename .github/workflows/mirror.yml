@@ -1,0 +1,45 @@
+# R2(게이트웨이)에 있는 배포 파일을 이 저장소 릴리스로 복사한다 — 한국에서 빠른 다운로드용 미러.
+# 원본·무결성의 기준은 게이트웨이 manifest.json(sha256). 여기 올린 파일은 그 sha256 과 대조한 뒤에만 올라간다.
+name: mirror
+on:
+  workflow_dispatch:
+    inputs:
+      keys:
+        description: "manifest 의 파일 key, 공백으로 여러 개 (예: strelizia/windows-x64/1.0.12/Strelizia.zip)"
+        required: true
+permissions:
+  contents: write
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: mirror
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEYS: ${{ inputs.keys }}
+        run: |
+          set -euo pipefail
+          GW=https://strelizia-gateway.lhh7878.workers.dev/releases
+          curl -fsSL "$GW/manifest.json" -o manifest.json
+          for KEY in $KEYS; do
+            read -r PROGRAM OS VERSION NAME SHA < <(python3 - "$KEY" <<'PY'
+          import json, sys
+          key = sys.argv[1]
+          m = json.load(open('manifest.json'))
+          for prog, p in m['programs'].items():
+              for os_, f in p['files'].items():
+                  if f['key'] == key:
+                      print(prog, os_, p['version'], key.split('/')[-1], f.get('sha256', ''))
+                      sys.exit(0)
+          sys.exit(f'not in manifest: {key}')
+          PY
+            )
+            if [ "$PROGRAM" = "launcher" ]; then TAG="launcher-v$VERSION"; else TAG="$PROGRAM-$OS-v$VERSION"; fi
+            curl -fsSL "$GW/$KEY" -o "$NAME"
+            echo "$SHA  $NAME" | sha256sum -c -
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$PROGRAM $OS $VERSION" --notes "sha256 $SHA"
+            gh release upload "$TAG" "$NAME" --repo "$GITHUB_REPOSITORY" --clobber
+            rm -f "$NAME"
+            echo "mirrored $KEY -> $TAG"
+          done
