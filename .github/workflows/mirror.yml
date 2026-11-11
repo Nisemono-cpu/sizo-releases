@@ -1,14 +1,26 @@
 # R2(게이트웨이)에 있는 배포 파일을 이 저장소 릴리스로 복사한다 — 한국에서 빠른 다운로드용 미러.
 # 원본·무결성의 기준은 게이트웨이 manifest.json(sha256). 여기 올린 파일은 그 sha256 과 대조한 뒤에만 올라간다.
+#
+# 두 가지로 돈다(2026-11-11):
+#   · keys 를 주면 그 파일만(게시 스크립트 publish-release.sh·publish-models.sh 가 바로 공개 직후 부른다).
+#   · keys 가 비었거나 15분마다 — manifest 의 현재 파일 중 미러에 아직 없는 것을 전부 채운다.
+#     런처·Strelizia 는 어드민 /releases 승인 순간에 공개되므로(게이트웨이 release_candidates.ts) 그 뒤를
+#     이 주기 실행이 잡는다. 빠뜨려도 다운로드는 안 깨지고 그동안만 느린 R2 로 받아질 뿐이다.
 name: mirror
 on:
   workflow_dispatch:
     inputs:
       keys:
-        description: "manifest 의 파일 key, 공백으로 여러 개 (예: strelizia/windows-x64/1.0.12/Strelizia.zip)"
-        required: true
+        description: "manifest 의 파일 key, 공백으로 여러 개 (비우면 미러에 없는 현재 파일 전부)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "*/15 * * * *"
 permissions:
   contents: write
+concurrency:
+  group: mirror
+  cancel-in-progress: false
 jobs:
   mirror:
     runs-on: ubuntu-latest
@@ -21,20 +33,34 @@ jobs:
           set -euo pipefail
           GW=https://strelizia-gateway.lhh7878.workers.dev/releases
           curl -fsSL "$GW/manifest.json" -o manifest.json
-          for KEY in $KEYS; do
-            read -r PROGRAM OS VERSION NAME SHA < <(python3 - "$KEY" <<'PY'
-          import json, sys
-          key = sys.argv[1]
+          # 현재 파일 목록: key program os version name sha256 (한 줄에 하나)
+          python3 - <<'PY' > current.txt
+          import json
           m = json.load(open('manifest.json'))
           for prog, p in m['programs'].items():
-              for os_, f in p['files'].items():
-                  if f['key'] == key:
-                      print(prog, os_, p['version'], key.split('/')[-1], f.get('sha256', ''))
-                      sys.exit(0)
-          sys.exit(f'not in manifest: {key}')
+              for os_, f in (p.get('files') or {}).items():
+                  if f.get('key'):
+                      print(f['key'], prog, os_, p['version'], f['key'].split('/')[-1], f.get('sha256', ''))
           PY
-            )
-            if [ "$PROGRAM" = "launcher" ]; then TAG="launcher-v$VERSION"; else TAG="$PROGRAM-$OS-v$VERSION"; fi
+          tag_of() { if [ "$1" = "launcher" ]; then echo "launcher-v$3"; else echo "$1-$2-v$3"; fi; }
+
+          if [ -z "${KEYS// }" ]; then
+            # 미러에 없는 현재 파일 고르기
+            KEYS=""
+            while read -r KEY PROGRAM OS VERSION NAME SHA; do
+              TAG=$(tag_of "$PROGRAM" "$OS" "$VERSION")
+              if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null | grep -qxF "$NAME"; then
+                KEYS="$KEYS $KEY"
+              fi
+            done < current.txt
+            [ -n "${KEYS// }" ] || { echo "미러할 새 파일 없음"; exit 0; }
+          fi
+
+          for KEY in $KEYS; do
+            LINE=$(awk -v k="$KEY" '$1 == k' current.txt)
+            [ -n "$LINE" ] || { echo "not in manifest: $KEY" >&2; exit 1; }
+            read -r _ PROGRAM OS VERSION NAME SHA <<<"$LINE"
+            TAG=$(tag_of "$PROGRAM" "$OS" "$VERSION")
             curl -fsSL "$GW/$KEY" -o "$NAME"
             echo "$SHA  $NAME" | sha256sum -c -
             gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
